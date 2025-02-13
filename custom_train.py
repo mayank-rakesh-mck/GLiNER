@@ -208,7 +208,7 @@ class Trainer:
 
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
 
-        train_loader = self.create_dataloader(dataset, model.data_processor, sampler=sampler, shuffle=False)
+        train_loader = train_loader = self.create_dataloader(dataset, model.module.data_processor if isinstance(model, DDP) else model.data_processor, sampler=sampler, shuffle=False)
 
         num_steps = self.config.num_steps // world_size
 
