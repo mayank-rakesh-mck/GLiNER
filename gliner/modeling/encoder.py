@@ -97,7 +97,7 @@ class Transformer(nn.Module):
             output_hidden_states = True
         else:
             output_hidden_states = False
-        output = self.model(*args, output_hidden_states = output_hidden_states, 
+        output = self.model(*args, #output_hidden_states = output_hidden_states, 
                                             return_dict = True,  **kwargs)
         if self.config.fuse_layers:
             encoder_layer = self.layers_fuser(output.hidden_states)
