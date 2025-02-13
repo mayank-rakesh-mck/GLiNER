@@ -178,7 +178,7 @@ class Trainer:
                                     set_class_token_index = False,
                                     add_tokens_to_tokenizer=False)
         if rank is not None:
-            model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+            model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
             if self.config.labels_encoder is None:
                 model.module.resize_token_embeddings([self.model_config.ent_token, self.model_config.sep_token], 
                                 set_class_token_index = False,
