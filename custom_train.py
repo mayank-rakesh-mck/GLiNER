@@ -194,7 +194,7 @@ class Trainer:
         # dataset = GLiNERDataset(dataset, config = self.config, data_processor=self.data_processor)
         # collator = DataCollatorWithPadding(self.config)
         collator = DataCollator(self.config, data_processor=data_processor, prepare_labels=True)
-        data_loader = DataLoader(dataset, batch_size=self.config.train_batch_size, num_workers=12,
+        data_loader = DataLoader(dataset, batch_size=self.config.train_batch_size, num_workers=2,
                                                         shuffle=shuffle, collate_fn=collator, sampler=sampler)
         return data_loader
     
