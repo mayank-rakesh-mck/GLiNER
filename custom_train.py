@@ -183,7 +183,7 @@ class Trainer:
                 model.module.resize_token_embeddings([self.model_config.ent_token, self.model_config.sep_token], 
                                 set_class_token_index = False,
                                 add_tokens_to_tokenizer=False)
-        optimizer = self.create_optimizer(model.model)
+        optimizer = self.create_optimizer(model.module if isinstance(model, DDP) else model)
 
         if self.compile_model:
             model.compile_for_training()
