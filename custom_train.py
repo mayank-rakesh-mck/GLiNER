@@ -178,12 +178,12 @@ class Trainer:
                                     set_class_token_index = False,
                                     add_tokens_to_tokenizer=False)
         if rank is not None:
-            model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+            model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
             if self.config.labels_encoder is None:
                 model.module.resize_token_embeddings([self.model_config.ent_token, self.model_config.sep_token], 
                                 set_class_token_index = False,
                                 add_tokens_to_tokenizer=False)
-        optimizer = self.create_optimizer(model.module if isinstance(model, DDP) else model)
+        optimizer = self.create_optimizer(model.model)
 
         if self.compile_model:
             model.compile_for_training()
@@ -194,7 +194,7 @@ class Trainer:
         # dataset = GLiNERDataset(dataset, config = self.config, data_processor=self.data_processor)
         # collator = DataCollatorWithPadding(self.config)
         collator = DataCollator(self.config, data_processor=data_processor, prepare_labels=True)
-        data_loader = DataLoader(dataset, batch_size=self.config.train_batch_size, num_workers=2,
+        data_loader = DataLoader(dataset, batch_size=self.config.train_batch_size, num_workers=12,
                                                         shuffle=shuffle, collate_fn=collator, sampler=sampler)
         return data_loader
     
@@ -208,7 +208,7 @@ class Trainer:
 
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
 
-        train_loader = train_loader = self.create_dataloader(dataset, model.module.data_processor if isinstance(model, DDP) else model.data_processor, sampler=sampler, shuffle=False)
+        train_loader = self.create_dataloader(dataset, model.data_processor, sampler=sampler, shuffle=False)
 
         num_steps = self.config.num_steps // world_size
 
@@ -282,8 +282,8 @@ class Trainer:
                     x[k] = v.to(device)
             
             try:
-                # with torch.cuda.amp.autocast(dtype=torch.float16):
-                loss = model(alpha = self.config.loss_alpha,
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    loss = model(alpha = self.config.loss_alpha,
                                     gamma = self.config.loss_gamma,
                                     label_smoothing = self.config.label_smoothing,
                                     reduction = self.config.loss_reduction,
