@@ -282,8 +282,8 @@ class Trainer:
                     x[k] = v.to(device)
             
             try:
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    loss = model(alpha = self.config.loss_alpha,
+                # with torch.cuda.amp.autocast(dtype=torch.float16):
+                loss = model(alpha = self.config.loss_alpha,
                                     gamma = self.config.loss_gamma,
                                     label_smoothing = self.config.label_smoothing,
                                     reduction = self.config.loss_reduction,
