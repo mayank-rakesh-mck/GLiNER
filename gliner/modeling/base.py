@@ -15,6 +15,43 @@ from .scorers import Scorer
 from .loss_functions import focal_loss_with_logits
 from .span_rep import SpanRepLayer
 
+class InterHeadText(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # Use a single projection for both inputs
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.softmax = nn.Softmax(dim=0)
+
+    def forward(self, text1, text2):
+        # Project both text inputs using the same layer
+        proj1 = self.proj(text1)
+        proj2 = self.proj(text2)
+
+        # Compute four interaction scores:
+        a_11 = (text1 * proj1).sum(-1)  # self-interaction of text1
+        a_12 = (text1 * proj2).sum(-1)  # cross-interaction: text1 with text2's projection
+        a_21 = (text2 * proj1).sum(-1)  # cross-interaction: text2 with text1's projection
+        a_22 = (text2 * proj2).sum(-1)  # self-interaction of text2
+
+        # Stack and apply softmax to obtain weights
+        weights1 = self.softmax(torch.stack([a_11, a_12], dim=0))
+        weights2 = self.softmax(torch.stack([a_21, a_22], dim=0))
+        w11, w12 = weights1.split([1, 1], dim=0)
+        w21, w22 = weights2.split([1, 1], dim=0)
+
+        # Reshape to allow broadcasting
+        w11 = w11.squeeze(0).unsqueeze(-1)
+        w12 = w12.squeeze(0).unsqueeze(-1)
+        w21 = w21.squeeze(0).unsqueeze(-1)
+        w22 = w22.squeeze(0).unsqueeze(-1)
+
+        # Create new representations as weighted combinations:
+        new_text1 = w11 * text1 + w12 * text2
+        new_text2 = w21 * text1 + w22 * text2
+
+        return new_text1, new_text2
+
+
 @dataclass
 class GLiNERModelOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
@@ -204,13 +241,19 @@ class BaseModel(ABC, nn.Module):
 class SpanModel(BaseModel):
     def __init__(self, config, encoder_from_pretrained):
         super(SpanModel, self).__init__(config, encoder_from_pretrained)
-        self.span_rep_layer = SpanRepLayer(span_mode = config.span_mode, 
-                                           hidden_size = config.hidden_size, 
-                                           max_width = config.max_width,
-                                           dropout = config.dropout)
-
+        self.span_rep_layer = SpanRepLayer(
+            span_mode=config.span_mode, 
+            hidden_size=config.hidden_size, 
+            max_width=config.max_width,
+            dropout=config.dropout
+        )
         self.prompt_rep_layer = create_projection_layer(config.hidden_size, config.dropout)
-
+        
+        # Create a stack (n layers) of interaction heads.
+        self.num_interaction_layers = 8
+        self.inter_heads = nn.ModuleList([
+            InterHeadText(config.hidden_size) for _ in range(self.num_interaction_layers)
+        ])
 
     def forward(self,        
                 input_ids: Optional[torch.FloatTensor] = None,
@@ -229,16 +272,21 @@ class SpanModel(BaseModel):
                 labels: Optional[torch.FloatTensor] = None,
                 **kwargs
                 ):
-
-        prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(input_ids, attention_mask, 
-                                                                                labels_embeddings, labels_input_ids, labels_attention_mask, 
-                                                                                                                    text_lengths, words_mask)
-        span_idx = span_idx*span_mask.unsqueeze(-1)
-
+        # Get initial representations.
+        prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
+            input_ids, attention_mask, 
+            labels_embeddings, labels_input_ids, labels_attention_mask, 
+            text_lengths, words_mask
+        )
+        span_idx = span_idx * span_mask.unsqueeze(-1)
         span_rep = self.span_rep_layer(words_embedding, span_idx)
-        
         prompts_embedding = self.prompt_rep_layer(prompts_embedding)
-
+        
+        # Iteratively apply n interaction layers to enable text-text interaction.
+        for inter_head in self.inter_heads:
+            span_rep, prompts_embedding = inter_head(span_rep, prompts_embedding)
+        
+        # Compute matching scores via einsum.
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
 
         loss = None
