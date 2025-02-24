@@ -52,6 +52,26 @@ class InterHeadText(nn.Module):
         return new_text1, new_text2
 
 
+class CrossAttentionHead(nn.Module):
+    """
+    A cross-attention layer that lets span representations (queries)
+    attend to prompt embeddings (keys/values). This supports different
+    sequence lengths between the two inputs.
+    """
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, span_rep, prompt_emb):
+        # span_rep: (B, N, hidden_dim) where N is total number of spans (flattened)
+        # prompt_emb: (B, C, hidden_dim) where C is number of prompt tokens
+        attn_output, _ = self.attn(query=span_rep, key=prompt_emb, value=prompt_emb)
+        # Apply residual connection and normalization
+        span_rep = self.norm(span_rep + self.dropout(attn_output))
+        return span_rep
+        
 @dataclass
 class GLiNERModelOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
@@ -249,10 +269,11 @@ class SpanModel(BaseModel):
         )
         self.prompt_rep_layer = create_projection_layer(config.hidden_size, config.dropout)
         
-        # Create a stack (n layers) of interaction heads.
-        self.num_interaction_layers = 8
-        self.inter_heads = nn.ModuleList([
-            InterHeadText(config.hidden_size) for _ in range(self.num_interaction_layers)
+        # Create n layers of cross-attention interaction heads.
+        self.num_interaction_layers = 5
+        self.cross_attn_layers = nn.ModuleList([
+            CrossAttentionHead(hidden_dim=config.hidden_size, num_heads=8, dropout=config.dropout)
+            for _ in range(self.num_interaction_layers)
         ])
 
     def forward(self,        
@@ -272,21 +293,35 @@ class SpanModel(BaseModel):
                 labels: Optional[torch.FloatTensor] = None,
                 **kwargs
                 ):
-        # Get initial representations.
+        # Get initial representations (implementation provided elsewhere)
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
             input_ids, attention_mask, 
             labels_embeddings, labels_input_ids, labels_attention_mask, 
             text_lengths, words_mask
         )
         span_idx = span_idx * span_mask.unsqueeze(-1)
+        # Obtain span representations: shape (B, L, K, hidden_dim)
         span_rep = self.span_rep_layer(words_embedding, span_idx)
+        # Get prompt embeddings: shape (B, C, hidden_dim)
         prompts_embedding = self.prompt_rep_layer(prompts_embedding)
         
-        # Iteratively apply n interaction layers to enable text-text interaction.
-        for inter_head in self.inter_heads:
-            span_rep, prompts_embedding = inter_head(span_rep, prompts_embedding)
+        # The two inputs have different sequence lengths:
+        #   span_rep: (B, L, K, hidden_dim) and prompts_embedding: (B, C, hidden_dim).
+        # Flatten span_rep over the span dimensions (L and K) to get shape (B, N, hidden_dim), where N = L * K.
+        B, L, K, D = span_rep.shape
+        span_rep_flat = span_rep.view(B, L * K, D)
         
-        # Compute matching scores via einsum.
+        # Apply each cross-attention layer to update span representations.
+        for cross_attn in self.cross_attn_layers:
+            span_rep_flat = cross_attn(span_rep_flat, prompts_embedding)
+        
+        # Reshape the updated span representations back to (B, L, K, hidden_dim)
+        span_rep = span_rep_flat.view(B, L, K, D)
+        
+        # Compute matching scores via einsum:
+        # span_rep: (B, L, K, hidden_dim)
+        # prompts_embedding: (B, C, hidden_dim)
+        # Resulting scores: (B, L, K, C)
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
 
         loss = None
