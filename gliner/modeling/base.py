@@ -15,63 +15,6 @@ from .scorers import Scorer
 from .loss_functions import focal_loss_with_logits
 from .span_rep import SpanRepLayer
 
-class InterHeadText(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        # Use a single projection for both inputs
-        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.softmax = nn.Softmax(dim=0)
-
-    def forward(self, text1, text2):
-        # Project both text inputs using the same layer
-        proj1 = self.proj(text1)
-        proj2 = self.proj(text2)
-
-        # Compute four interaction scores:
-        a_11 = (text1 * proj1).sum(-1)  # self-interaction of text1
-        a_12 = (text1 * proj2).sum(-1)  # cross-interaction: text1 with text2's projection
-        a_21 = (text2 * proj1).sum(-1)  # cross-interaction: text2 with text1's projection
-        a_22 = (text2 * proj2).sum(-1)  # self-interaction of text2
-
-        # Stack and apply softmax to obtain weights
-        weights1 = self.softmax(torch.stack([a_11, a_12], dim=0))
-        weights2 = self.softmax(torch.stack([a_21, a_22], dim=0))
-        w11, w12 = weights1.split([1, 1], dim=0)
-        w21, w22 = weights2.split([1, 1], dim=0)
-
-        # Reshape to allow broadcasting
-        w11 = w11.squeeze(0).unsqueeze(-1)
-        w12 = w12.squeeze(0).unsqueeze(-1)
-        w21 = w21.squeeze(0).unsqueeze(-1)
-        w22 = w22.squeeze(0).unsqueeze(-1)
-
-        # Create new representations as weighted combinations:
-        new_text1 = w11 * text1 + w12 * text2
-        new_text2 = w21 * text1 + w22 * text2
-
-        return new_text1, new_text2
-
-
-class CrossAttentionHead(nn.Module):
-    """
-    A cross-attention layer that lets span representations (queries)
-    attend to prompt embeddings (keys/values). This supports different
-    sequence lengths between the two inputs.
-    """
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, span_rep, prompt_emb):
-        # span_rep: (B, N, hidden_dim) where N is total number of spans (flattened)
-        # prompt_emb: (B, C, hidden_dim) where C is number of prompt tokens
-        attn_output, _ = self.attn(query=span_rep, key=prompt_emb, value=prompt_emb)
-        # Apply residual connection and normalization
-        span_rep = self.norm(span_rep + self.dropout(attn_output))
-        return span_rep
-        
 @dataclass
 class GLiNERModelOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
@@ -261,20 +204,13 @@ class BaseModel(ABC, nn.Module):
 class SpanModel(BaseModel):
     def __init__(self, config, encoder_from_pretrained):
         super(SpanModel, self).__init__(config, encoder_from_pretrained)
-        self.span_rep_layer = SpanRepLayer(
-            span_mode=config.span_mode, 
-            hidden_size=config.hidden_size, 
-            max_width=config.max_width,
-            dropout=config.dropout
-        )
+        self.span_rep_layer = SpanRepLayer(span_mode = config.span_mode, 
+                                           hidden_size = config.hidden_size, 
+                                           max_width = config.max_width,
+                                           dropout = config.dropout)
+
         self.prompt_rep_layer = create_projection_layer(config.hidden_size, config.dropout)
-        
-        # Create n layers of cross-attention interaction heads.
-        self.num_interaction_layers = 5
-        self.cross_attn_layers = nn.ModuleList([
-            CrossAttentionHead(hidden_dim=config.hidden_size, num_heads=8, dropout=config.dropout)
-            for _ in range(self.num_interaction_layers)
-        ])
+
 
     def forward(self,        
                 input_ids: Optional[torch.FloatTensor] = None,
@@ -293,35 +229,16 @@ class SpanModel(BaseModel):
                 labels: Optional[torch.FloatTensor] = None,
                 **kwargs
                 ):
-        # Get initial representations (implementation provided elsewhere)
-        prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(
-            input_ids, attention_mask, 
-            labels_embeddings, labels_input_ids, labels_attention_mask, 
-            text_lengths, words_mask
-        )
-        span_idx = span_idx * span_mask.unsqueeze(-1)
-        # Obtain span representations: shape (B, L, K, hidden_dim)
+
+        prompts_embedding, prompts_embedding_mask, words_embedding, mask = self.get_representations(input_ids, attention_mask, 
+                                                                                labels_embeddings, labels_input_ids, labels_attention_mask, 
+                                                                                                                    text_lengths, words_mask)
+        span_idx = span_idx*span_mask.unsqueeze(-1)
+
         span_rep = self.span_rep_layer(words_embedding, span_idx)
-        # Get prompt embeddings: shape (B, C, hidden_dim)
+        
         prompts_embedding = self.prompt_rep_layer(prompts_embedding)
-        
-        # The two inputs have different sequence lengths:
-        #   span_rep: (B, L, K, hidden_dim) and prompts_embedding: (B, C, hidden_dim).
-        # Flatten span_rep over the span dimensions (L and K) to get shape (B, N, hidden_dim), where N = L * K.
-        B, L, K, D = span_rep.shape
-        span_rep_flat = span_rep.view(B, L * K, D)
-        
-        # Apply each cross-attention layer to update span representations.
-        for cross_attn in self.cross_attn_layers:
-            span_rep_flat = cross_attn(span_rep_flat, prompts_embedding)
-        
-        # Reshape the updated span representations back to (B, L, K, hidden_dim)
-        span_rep = span_rep_flat.view(B, L, K, D)
-        
-        # Compute matching scores via einsum:
-        # span_rep: (B, L, K, hidden_dim)
-        # prompts_embedding: (B, C, hidden_dim)
-        # Resulting scores: (B, L, K, C)
+
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
 
         loss = None
